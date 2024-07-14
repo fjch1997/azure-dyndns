@@ -203,7 +203,7 @@ namespace AzureDynDns
         private static bool IsUlaAddress(IPAddress address)
         {
             var addressString = address.ToString();
-            return addressString.StartsWith("fc00:") || addressString.StartsWith("fd00:");
+            return addressString.StartsWith("fc") || addressString.StartsWith("fd");
         }
 
         private static bool IsIpv4LinkLocal(IPAddress address)
