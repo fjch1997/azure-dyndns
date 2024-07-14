@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -58,12 +59,19 @@ namespace AzureDynDns
             [Option('a', "interface-address-family", HelpText = "When the interface-name parameter is specified, use this parameter to limit the address family obtained from the interface. Possible values are IPv4, IPv6 and Any.", Required = false)]
             public IList<InterfaceAddressFamily> InterfaceAddressFamilies { get; set; }
             [JsonPropertyName("ttl")]
-            [Option('l', "TTL", HelpText = "A Time-to-live value for the DNS records.", Default = 3600)]
-            public long TTL { get; set; }
+            [Option('l', "ttl", HelpText = "A Time-to-live value for the DNS records.", Default = 3600)]
+            public long Ttl { get; set; }
+            [JsonPropertyName("dryRun")]
+            [Option('d', "dry-run", HelpText = "Display the IP addresses to be updated instead of updating them in Azure.", Default = false)]
+            public bool DryRun { get; set; }
+            [JsonPropertyName("hassio")]
+            [Option('h', "hassio", HelpText = "Use ha network info to get IP addresses.", Default = false)]
+            public bool Hassio { get; set; }
         }
+
         public static async Task Main(string[] args)
         {
-            await Parser.Default.ParseArguments<Options>(args).WithParsedAsync(async (o) => await UpdateDNS(o));
+            await Parser.Default.ParseArguments<Options>(args).WithParsedAsync(UpdateDNS);
         }
 
         public static async Task UpdateDNS(Options options)
@@ -85,7 +93,7 @@ namespace AzureDynDns
             {
                 interfaces.Add(options.InterfaceNames[i], options.InterfaceAddressFamilies.Count == 0 ? InterfaceAddressFamily.Any : options.InterfaceAddressFamilies[i]);
             }
-            await foreach (var ip in GetPublicIPs(interfaces))
+            await foreach (var ip in GetPublicIPs(interfaces, options))
             {
                 switch (ip.AddressFamily)
                 {
@@ -105,20 +113,33 @@ namespace AzureDynDns
 
             SetMetadata(aRecordSet);
             SetMetadata(aaaaRecordSet);
-            aRecordSet.TTL = options.TTL;
-            aaaaRecordSet.TTL = options.TTL;
-
-            var (tenantId, clientId, clientSecret) = GetCredentialInfo(options);
-            var creds = await ApplicationTokenProvider.LoginSilentAsync(tenantId, clientId, clientSecret);
-            var dnsClient = new DnsManagementClient(creds);
-            dnsClient.SubscriptionId = options.SubscriptionId;
-            if (aRecordSet.ARecords.Count > 0)
+            aRecordSet.TTL = options.Ttl;
+            aaaaRecordSet.TTL = options.Ttl;
+            if (options.DryRun)
             {
-                Console.WriteLine(JsonSerializer.Serialize(await dnsClient.RecordSets.CreateOrUpdateAsync(options.ResourceGroup, options.Zone, options.Record, RecordType.A, aRecordSet)));
+                foreach (var record in aRecordSet.ARecords)
+                {
+                    Console.WriteLine(record.Ipv4Address.ToString());
+                }
+                foreach (var record in aaaaRecordSet.AaaaRecords)
+                {
+                    Console.WriteLine(record.Ipv6Address.ToString());
+                }
             }
-            if (aaaaRecordSet.AaaaRecords.Count > 0)
+            else
             {
-                Console.WriteLine(JsonSerializer.Serialize(await dnsClient.RecordSets.CreateOrUpdateAsync(options.ResourceGroup, options.Zone, options.Record, RecordType.AAAA, aaaaRecordSet)));
+                var (tenantId, clientId, clientSecret) = GetCredentialInfo(options);
+                var creds = await ApplicationTokenProvider.LoginSilentAsync(tenantId, clientId, clientSecret);
+                var dnsClient = new DnsManagementClient(creds);
+                dnsClient.SubscriptionId = options.SubscriptionId;
+                if (aRecordSet.ARecords.Count > 0)
+                {
+                    Console.WriteLine(JsonSerializer.Serialize(await dnsClient.RecordSets.CreateOrUpdateAsync(options.ResourceGroup, options.Zone, options.Record, RecordType.A, aRecordSet)));
+                }
+                if (aaaaRecordSet.AaaaRecords.Count > 0)
+                {
+                    Console.WriteLine(JsonSerializer.Serialize(await dnsClient.RecordSets.CreateOrUpdateAsync(options.ResourceGroup, options.Zone, options.Record, RecordType.AAAA, aaaaRecordSet)));
+                }
             }
         }
 
@@ -131,21 +152,23 @@ namespace AzureDynDns
             };
         }
 
-        public static async IAsyncEnumerable<IPAddress> GetPublicIPs(Dictionary<string, InterfaceAddressFamily> interfaces)
+        public static async IAsyncEnumerable<IPAddress> GetPublicIPs(Dictionary<string, InterfaceAddressFamily> interfaces, Options options)
         {
             if (interfaces.Count == 0)
             {
                 var client = new HttpClient();
                 yield return IPAddress.Parse(await client.GetStringAsync("https://ifconfig.me"));
+                yield break;
             }
-
-            foreach (var networkInterface in NetworkInterface.GetAllNetworkInterfaces())
+            foreach (var networkInterface in options.Hassio ? HassioNetworkInterface.GetAllNetworkInterfaces().AsEnumerable() : NetworkInterface.GetAllNetworkInterfaces().AsEnumerable())
             {
                 if (!interfaces.TryGetValue(networkInterface.Name, out var requestedAddressFamily))
                     continue;
                 foreach (var address in networkInterface.GetIPProperties().UnicastAddresses)
                 {
-                    if (!address.Address.IsIPv6Teredo && !address.Address.IsIPv4MappedToIPv6 && !address.Address.IsIPv6SiteLocal && !address.Address.IsIPv6LinkLocal && !address.Address.IsIPv6Multicast && !address.Address.IsIPv6SiteLocal && !address.IsTransient && address.IsDnsEligible && !IsUlaAddress(address.Address))
+                    if (!address.Address.IsIPv6Teredo && !address.Address.IsIPv4MappedToIPv6 && !address.Address.IsIPv6SiteLocal && !address.Address.IsIPv6LinkLocal &&
+                        !address.Address.IsIPv6Multicast && !address.Address.IsIPv6SiteLocal && !IsIpv4LinkLocal(address.Address) && !IsIpv4Loopback(address.Address) &&
+                        !IsUlaAddress(address.Address))
                     {
                         switch (requestedAddressFamily)
                         {
@@ -181,6 +204,16 @@ namespace AzureDynDns
         {
             var addressString = address.ToString();
             return addressString.StartsWith("fc00:") || addressString.StartsWith("fd00:");
+        }
+
+        private static bool IsIpv4LinkLocal(IPAddress address)
+        {
+            return address.ToString().StartsWith("169.254");
+        }
+
+        private static bool IsIpv4Loopback(IPAddress address)
+        {
+            return address.ToString().StartsWith("127.");
         }
     }
 }
